@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 import base64
+import shutil
 import hashlib
 from flask import Flask, request, render_template_string
 from qiskit import QuantumCircuit
@@ -20,7 +21,7 @@ failed_fast = 0
 troll_level = 0
 data_wiped = False
 last_attempt = time.time()
-current_target_file = None  # NEW: Asli file ko track karne ke liye!
+current_target_file = None  # System ab automatically isko track karega!
 
 # ====================================================
 # 2. CRYPTOGRAPHY ENGINE
@@ -142,14 +143,15 @@ def decrypt_route():
     
     if enc_file:
         with state_lock:
-            # Web upload ke liye file ko locally save karke target set karna
+            # Web upload ko temp location mein save karke track karo
             web_filename = "web_target.bin"
             enc_file.save(web_filename)
-            current_target_file = web_filename
-            failed_fast = 0
-            troll_level = 0
-            data_wiped = False
-            last_attempt = time.time()
+            if current_target_file != web_filename:
+                current_target_file = web_filename
+                failed_fast = 0
+                troll_level = 0
+                data_wiped = False
+                last_attempt = time.time()
             
     response_msg, wipe_status = evaluate_defense(password, is_web=True)
     return render_template_string(HTML_TEMPLATE, msg=response_msg)
@@ -164,7 +166,7 @@ def evaluate_defense(input_pass, is_web=False):
         if data_wiped:
             return "[ERROR 404] Data nahi hai yahan. Ghar jao.", True
 
-        # Check if we have an actual file targeted
+        # Check if we have an actual file being attacked
         if current_target_file and os.path.exists(current_target_file):
             try:
                 with open(current_target_file, "rb") as f:
@@ -218,24 +220,24 @@ def evaluate_defense(input_pass, is_web=False):
                     return f"[ACCESS GRANTED] Unlocked: {original_filename}\n[SUCCESS] File saved locally as: \033[93m{out_name}\033[0m\nQuantum Salt Used: {q_salt}", False
                     
             except (InvalidToken, ValueError):
-                pass # GALAT PASSWORD -> Defense activate hogi
+                pass # GALAT PASSWORD -> Trap defense activated
             except Exception as e:
                 return f"[SYSTEM ERROR] {str(e)}", False
         else:
-            return "[WARNING] No active target set! Use /target <path> first.", False
+            return "[WARNING] No active file target detected.", False
 
-        # === 🚨 STAGE 3: BRUTAL WIPE (DELETES THE ACTUAL TARGET FILE) 🚨 ===
+        # === 🚨 STAGE 3: BRUTAL WIPE (DELETES THE ACTUAL FILE) 🚨 ===
         if troll_level == 2:
             data_wiped = True
             if current_target_file and os.path.exists(current_target_file):
                 try:
-                    # Asli file ko kachre (garbage) se overwrite karke uda dena!
+                    # Asli file ko kachre se overwrite karke uda dena!
                     with open(current_target_file, "wb") as f:
                         f.write(b"0xDEADBEEF" * 100) 
                     os.remove(current_target_file)
                 except:
                     pass
-                current_target_file = None # Reset kar do, kyunki file toh jal chuki hai!
+                current_target_file = None # Reset kar do
             return "JAO TAB KARO TEEN PAANCH TUMLOG HUM UDA DIYE DATA", True
 
         # === STAGE 2: Second Strike ===
@@ -293,8 +295,8 @@ if __name__ == "__main__":
                 print("=== SYSTEM COMMANDS ===")
                 print("  /encrypt <path>  : Encrypt a file (Creates locked_file.bin)")
                 print("  /decrypt <path>  : Decrypt a file (Creates decrypted_file)")
-                print("  /target <path>   : Target ANY local .bin file for Brute-Force Trap")
-                print("  <any other text> : Try to unlock the Active Target")
+                print("  /help            : Show this menu")
+                print("  /exit            : Terminate terminal")
                 print("\033[0m")
                 continue
                 
@@ -321,19 +323,24 @@ if __name__ == "__main__":
                     print("\033[91m\n[ERROR] File not found!\033[0m\n")
                 continue
                 
-            # COMMAND: DECRYPT (Set Target & Unlock)
+            # COMMAND: DECRYPT (Ab koi separate target zaroori nahi)
             if user_input.lower().startswith("/decrypt "):
                 filepath = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
                 if os.path.exists(filepath):
                     with state_lock:
-                        # NEW: Asli file path set karna bina copy kiye
-                        current_target_file = filepath 
-                        failed_fast = 0
-                        troll_level = 0
-                        data_wiped = False
-                        last_attempt = time.time()
+                        # Sirf target set karo (copy mat karo) aur naye attack ke liye reset karo
+                        if current_target_file != filepath:
+                            current_target_file = filepath 
+                            failed_fast = 0
+                            troll_level = 0
+                            data_wiped = False
+                            last_attempt = time.time()
                     
-                    unlock_pass = input("\033[93mEnter Password to Unlock: \033[0m").strip()
+                    try:
+                        unlock_pass = input("\033[93mEnter Password to Unlock: \033[0m").strip()
+                    except EOFError:
+                        break # Handles pipeline input ending gracefully
+                        
                     response, is_wiped = evaluate_defense(unlock_pass, is_web=False)
                     
                     if "GRANTED" in response:
@@ -346,23 +353,7 @@ if __name__ == "__main__":
                     print("\033[91m\n[ERROR] File not found!\033[0m\n")
                 continue
 
-            # COMMAND: TARGET (Set for Hackers Demo)
-            if user_input.lower().startswith("/target "):
-                filepath = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
-                if os.path.exists(filepath):
-                    with state_lock:
-                        # NEW: Crosshair locked on Original File!
-                        current_target_file = filepath 
-                        failed_fast = 0
-                        troll_level = 0
-                        data_wiped = False
-                        last_attempt = time.time()
-                    print(f"\033[92m\n[STATUS] Target Locked onto '{filepath}'! Ready for Brute-Force Demo. 😎\033[0m\n")
-                else:
-                    print("\033[91m\n[ERROR] File not found!\033[0m\n")
-                continue
-
-            # DEFAULT: BRUTE-FORCE CATCHER
+            # DEFAULT: Agar bina command ke random input aaye (e.g., pipeline se password aayein)
             response, is_wiped = evaluate_defense(user_input, is_web=False)
             
             if "GRANTED" in response:
