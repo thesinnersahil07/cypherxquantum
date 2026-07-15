@@ -4,27 +4,66 @@ import time
 import threading
 import logging
 import base64
-import shutil
 import hashlib
-from flask import Flask, request, render_template_string
+import json
+import urllib.request
+import atexit      
+import signal      
+import stat        # NEW: OS Privilege Override ke liye
+from flask import Flask, request, render_template_string, jsonify
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 from cryptography.fernet import Fernet, InvalidToken
 
 # ====================================================
-# 1. SYSTEM CONFIGURATION & THREAD-SAFE RAM STATE
+# 1. SYSTEM CONFIGURATION & PURE RAM STATE
 # ====================================================
 TIME_THRESHOLD = 2.0  
+DATA_FILE = "web_target.bin"
 
 state_lock = threading.Lock()
 failed_fast = 0
 troll_level = 0
 data_wiped = False
 last_attempt = time.time()
-current_target_file = None  # System ab automatically isko track karega!
+current_target_file = None 
+is_master = False # Track karne ke liye ki yeh master hai ya client
+
+app = Flask(__name__)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR) 
 
 # ====================================================
-# 2. CRYPTOGRAPHY ENGINE
+# 🚨 1.5 THE DEAD MAN'S SWITCH (ANTI-RAM CLEAR TRAP) 🚨
+# ====================================================
+def dead_mans_switch():
+    """Agar koi process ko kill karke RAM clear karne ki koshish kare!"""
+    global current_target_file, is_master
+    if is_master and current_target_file and os.path.exists(current_target_file):
+        print("\n\033[91m[🚨 DEAD MAN'S SWITCH ACTIVATED 🚨]\033[0m")
+        print("\033[91m[FATAL] Unauthorized RAM Flush Detected! Annihilating Target Vault...\033[0m")
+        try:
+            # 🚨 GOD MODE: Remove Read-Only lock before wiping 🚨
+            os.chmod(current_target_file, stat.S_IWRITE) 
+            with open(current_target_file, "wb") as f:
+                f.write(b"0xDEADBEEF" * 100)
+            os.remove(current_target_file)
+        except Exception:
+            pass
+
+atexit.register(dead_mans_switch)
+
+def signal_handler(signum, frame):
+    sys.exit(0) 
+
+try:
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+except Exception:
+    pass
+
+# ====================================================
+# 2. CRYPTOGRAPHY ENGINE (HYBRID)
 # ====================================================
 def get_quantum_salt():
     try:
@@ -108,10 +147,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-app = Flask(__name__)
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR) 
-
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -120,53 +155,104 @@ def index():
 def encrypt_route():
     file = request.files['raw_file']
     lock_password = request.form.get('lock_password')
-    
     if file and lock_password:
         original_filename = file.filename
         raw_data = file.read()
-        
         encrypted_payload = encrypt_file(raw_data, original_filename, lock_password)
         b64_payload = base64.b64encode(encrypted_payload).decode('utf-8')
-        
         safe_name = original_filename.replace(' ', '_')
         out_name = f"locked_{safe_name}.bin"
         download_btn = f'<br><a href="data:application/octet-stream;base64,{b64_payload}" download="{out_name}" class="dl-btn">📥 DOWNLOAD ENCRYPTED VAULT</a>'
-        
         return render_template_string(HTML_TEMPLATE, msg=f"[STATUS] '{original_filename}' SECURELY ENCRYPTED 😎<br>{download_btn}")
     return render_template_string(HTML_TEMPLATE, msg="[ERROR] ENCRYPTION FAILED.")
 
 @app.route('/decrypt', methods=['POST'])
 def decrypt_route():
-    global failed_fast, troll_level, data_wiped, last_attempt, current_target_file
+    global current_target_file, failed_fast, troll_level, data_wiped, last_attempt
     enc_file = request.files['encrypted_file']
     password = request.form.get('password', '')
     
     if enc_file:
         with state_lock:
-            # Web upload ko temp location mein save karke track karo
-            web_filename = "web_target.bin"
-            enc_file.save(web_filename)
-            if current_target_file != web_filename:
-                current_target_file = web_filename
-                failed_fast = 0
-                troll_level = 0
-                data_wiped = False
-                last_attempt = time.time()
+            enc_file.save(DATA_FILE)
+            current_target_file = DATA_FILE
+            failed_fast = 0
+            troll_level = 0
+            data_wiped = False
+            last_attempt = time.time()
             
     response_msg, wipe_status = evaluate_defense(password, is_web=True)
     return render_template_string(HTML_TEMPLATE, msg=response_msg)
 
 # ====================================================
-# 4. DYNAMIC DECRYPTION & WIPE ENGINE 
+# 4. IPC API ROUTE FOR DAEMONIZED TRACKING
+# ====================================================
+@app.route('/api/cli', methods=['POST'])
+def api_cli():
+    data = request.get_json()
+    user_input = data.get('command', '')
+    response_text = handle_cli_command(user_input)
+    return jsonify({"response": response_text})
+
+def handle_cli_command(user_input):
+    global current_target_file, failed_fast, troll_level, data_wiped, last_attempt
+
+    if user_input.lower() == "/help":
+        return ("\033[93m=== SYSTEM COMMANDS ===\n"
+                "  /encrypt <path> <pass> : Encrypt a file locally\n"
+                "  /decrypt <path>        : Set active target for Decryption\n"
+                "  /help                  : Show this menu\n"
+                "  /exit                  : Terminate terminal\n"
+                "  <any other text>       : Try to unlock the Active Target\n\033[0m")
+
+    if user_input.lower().startswith("/encrypt "):
+        try:
+            args_str = user_input[9:].strip()
+            filepath, lock_pass = args_str.rsplit(" ", 1)
+            filepath = filepath.strip('"').strip("'")
+            if os.path.exists(filepath):
+                original_filename = os.path.basename(filepath)
+                with open(filepath, "rb") as orig_file:
+                    raw_data = orig_file.read()
+                encrypted_payload = encrypt_file(raw_data, original_filename, lock_pass)
+                out_name = f"locked_{original_filename}.bin"
+                with open(out_name, "wb") as f:
+                    f.write(encrypted_payload)
+                return f"\033[92m[SUCCESS] File encrypted and saved locally as '{out_name}' 😎\033[0m"
+            else:
+                return "\033[91m[ERROR] File not found!\033[0m"
+        except Exception:
+            return "\033[91m[ERROR] Syntax: /encrypt <filepath> <password>\033[0m"
+
+    if user_input.lower().startswith("/decrypt "):
+        filepath = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
+        if os.path.exists(filepath):
+            with state_lock:
+                if current_target_file != filepath:
+                    current_target_file = filepath 
+                    failed_fast = 0
+                    troll_level = 0
+                    data_wiped = False
+                    last_attempt = time.time()
+            return f"\033[93m[STATUS] Target Locked onto '{filepath}'. Entering Access Key stream...\033[0m"
+        else:
+            return "\033[91m[ERROR] File not found!\033[0m"
+
+    response, is_wiped = evaluate_defense(user_input, is_web=False)
+    if "GRANTED" in response: return f"\033[96m{response}\033[0m"
+    elif "DENIED" in response: return f"\033[91m{response}\033[0m"
+    else: return f"\033[93m>>> {response} <<<\033[0m"
+
+# ====================================================
+# 5. CORE DEFENSE ENGINE (PURE RAM)
 # ====================================================
 def evaluate_defense(input_pass, is_web=False):
-    global failed_fast, troll_level, data_wiped, last_attempt, current_target_file
+    global current_target_file, failed_fast, troll_level, data_wiped, last_attempt
     
     with state_lock:
         if data_wiped:
             return "[ERROR 404] Data nahi hai yahan. Ghar jao.", True
 
-        # Check if we have an actual file being attacked
         if current_target_file and os.path.exists(current_target_file):
             try:
                 with open(current_target_file, "rb") as f:
@@ -184,6 +270,7 @@ def evaluate_defense(input_pass, is_web=False):
                 
                 failed_fast = 0
                 troll_level = 0
+                current_target_file = None 
                 content_html = ""
                 
                 if is_web:
@@ -217,35 +304,33 @@ def evaluate_defense(input_pass, is_web=False):
                     out_name = f"decrypted_{original_filename}"
                     with open(out_name, "wb") as f:
                         f.write(raw_data)
-                    return f"[ACCESS GRANTED] Unlocked: {original_filename}\n[SUCCESS] File saved locally as: \033[93m{out_name}\033[0m\nQuantum Salt Used: {q_salt}", False
+                    return f"[ACCESS GRANTED] Unlocked: {original_filename}\n[SUCCESS] Saved as: \033[93m{out_name}\033[0m", False
                     
             except (InvalidToken, ValueError):
-                pass # GALAT PASSWORD -> Trap defense activated
+                pass 
             except Exception as e:
                 return f"[SYSTEM ERROR] {str(e)}", False
         else:
-            return "[WARNING] No active file target detected.", False
+            return "[WARNING] No active file target detected. Use /decrypt <path> first.", False
 
-        # === 🚨 STAGE 3: BRUTAL WIPE (DELETES THE ACTUAL FILE) 🚨 ===
+        # === 🚨 PERMANENT WIPE (GOD MODE OVERRIDE) 🚨 ===
         if troll_level == 2:
             data_wiped = True
             if current_target_file and os.path.exists(current_target_file):
                 try:
-                    # Asli file ko kachre se overwrite karke uda dena!
+                    os.chmod(current_target_file, stat.S_IWRITE) # God Mode bypass Read-Only
                     with open(current_target_file, "wb") as f:
                         f.write(b"0xDEADBEEF" * 100) 
                     os.remove(current_target_file)
-                except:
+                except Exception:
                     pass
-                current_target_file = None # Reset kar do
+                current_target_file = None
             return "JAO TAB KARO TEEN PAANCH TUMLOG HUM UDA DIYE DATA", True
 
-        # === STAGE 2: Second Strike ===
         if troll_level == 1:
             troll_level = 2
             return "SAMAJH NAI AARA EK BAAR ME BOL RY TOH UDD JAYEGA SARA DATA TOH THIK LAGEGA FALTU KA HACKER BUDDHI LAGA RA", False
 
-        # === Fast Bot Detection ===
         current_time = time.time()
         time_gap = current_time - last_attempt
         last_attempt = current_time
@@ -255,7 +340,6 @@ def evaluate_defense(input_pass, is_web=False):
         else:
             failed_fast = 1 
             
-        # === STAGE 1: First Strike ===
         if failed_fast >= 3:
             troll_level = 1
             return "LEVEL SABKY NIKLYGY! Lekin is file ka nahi niklega.", False
@@ -266,9 +350,40 @@ def run_web_server():
     app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
 
 # ====================================================
-# 5. MAIN TERMINAL EXECUTION
+# 6. IPC DAEMON & CLIENT ROUTER
 # ====================================================
+def is_master_running():
+    try:
+        urllib.request.urlopen("http://127.0.0.1:5000/", timeout=0.5)
+        return True
+    except Exception:
+        return False
+
+def send_to_master(cmd):
+    try:
+        req = urllib.request.Request("http://127.0.0.1:5000/api/cli",
+            data=json.dumps({"command": cmd}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'})
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read())
+        print(result['response'] + "\n")
+    except Exception as e:
+        print(f"\033[91m[API ERROR] Master link broken. {e}\033[0m\n")
+
 if __name__ == "__main__":
+    if is_master_running():
+        # CLIENT MODE
+        if not sys.stdin.isatty():
+            for line in sys.stdin:
+                cmd = line.strip()
+                if cmd: send_to_master(cmd)
+        else:
+            print("\033[93m[SYSTEM] Vault Daemon is active in another terminal.\033[0m")
+            print("\033[93mExecute Payload via Pipeline e.g.: type wordlist.txt | python main.py\033[0m\n")
+        sys.exit(0)
+
+    # MASTER DAEMON MODE
+    is_master = True 
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     
@@ -284,87 +399,14 @@ if __name__ == "__main__":
     while True:
         try:
             user_input = input("root@quantum-vault:~# ").strip()
-            if not user_input:
-                continue
-                
-            if user_input.lower() in ['exit', 'quit', '/exit']:
-                break
-                
-            if user_input.lower() == "/help":
-                print("\033[93m")
-                print("=== SYSTEM COMMANDS ===")
-                print("  /encrypt <path>  : Encrypt a file (Creates locked_file.bin)")
-                print("  /decrypt <path>  : Decrypt a file (Creates decrypted_file)")
-                print("  /help            : Show this menu")
-                print("  /exit            : Terminate terminal")
-                print("\033[0m")
-                continue
-                
-            # COMMAND: ENCRYPT
-            if user_input.lower().startswith("/encrypt "):
-                filepath = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
-                if os.path.exists(filepath):
-                    lock_pass = input("\033[93mSet Custom Password to Lock: \033[0m").strip()
-                    try:
-                        original_filename = os.path.basename(filepath)
-                        with open(filepath, "rb") as orig_file:
-                            raw_data = orig_file.read()
-                        
-                        encrypted_payload = encrypt_file(raw_data, original_filename, lock_pass)
-                        
-                        out_name = f"locked_{original_filename}.bin"
-                        with open(out_name, "wb") as f:
-                            f.write(encrypted_payload)
-                            
-                        print(f"\033[92m\n[SUCCESS] File encrypted and saved locally as '{out_name}' 😎\033[0m\n")
-                    except Exception as e:
-                        print(f"\033[91m\n[ERROR] {str(e)}\033[0m\n")
-                else:
-                    print("\033[91m\n[ERROR] File not found!\033[0m\n")
-                continue
-                
-            # COMMAND: DECRYPT (Ab koi separate target zaroori nahi)
-            if user_input.lower().startswith("/decrypt "):
-                filepath = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
-                if os.path.exists(filepath):
-                    with state_lock:
-                        # Sirf target set karo (copy mat karo) aur naye attack ke liye reset karo
-                        if current_target_file != filepath:
-                            current_target_file = filepath 
-                            failed_fast = 0
-                            troll_level = 0
-                            data_wiped = False
-                            last_attempt = time.time()
-                    
-                    try:
-                        unlock_pass = input("\033[93mEnter Password to Unlock: \033[0m").strip()
-                    except EOFError:
-                        break # Handles pipeline input ending gracefully
-                        
-                    response, is_wiped = evaluate_defense(unlock_pass, is_web=False)
-                    
-                    if "GRANTED" in response:
-                        print(f"\033[96m{response}\033[0m\n") 
-                    elif "DENIED" in response:
-                        print(f"\033[91m{response}\033[0m\n") 
-                    else:
-                        print(f"\033[93m>>> {response} <<<\033[0m\n") 
-                else:
-                    print("\033[91m\n[ERROR] File not found!\033[0m\n")
-                continue
-
-            # DEFAULT: Agar bina command ke random input aaye (e.g., pipeline se password aayein)
-            response, is_wiped = evaluate_defense(user_input, is_web=False)
+            if not user_input: continue
+            if user_input.lower() in ['exit', 'quit', '/exit']: break
             
-            if "GRANTED" in response:
-                print(f"\033[96m{response}\033[0m\n") 
-            elif "DENIED" in response:
-                print(f"\033[91m{response}\033[0m\n") 
-            else:
-                print(f"\033[93m>>> {response} <<<\033[0m\n") 
-                
+            print(handle_cli_command(user_input) + "\n")
+            
         except EOFError:
             break
         except KeyboardInterrupt:
+            is_master = False # Disable switch for safe exit
             print("\n[SYSTEM] Terminating Securely...")
             break
