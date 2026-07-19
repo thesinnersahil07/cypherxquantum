@@ -4,7 +4,6 @@ import time
 import threading
 import logging
 import base64
-import hashlib
 import json
 import urllib.request
 import atexit      
@@ -13,10 +12,11 @@ import stat
 from flask import Flask, request, render_template_string, jsonify
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
+
+# --- NEW ENTERPRISE SECURITY IMPORTS ---
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+import argon2
 
 # ====================================================
 # 1. SYSTEM CONFIGURATION & PURE RAM STATE
@@ -62,7 +62,7 @@ except Exception:
     pass
 
 # ====================================================
-# 2. ADVANCED HYBRID CRYPTOGRAPHY ENGINE (STEALTH)
+# 2. V4 CRYPTO ENGINE (ARGON2id + AES-256-GCM)
 # ====================================================
 def get_quantum_salt():
     try:
@@ -77,24 +77,31 @@ def get_quantum_salt():
         return "Q-FALLBACK"
 
 def generate_key(password, salt):
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
+    # Argon2id: Memory-Hard KDF (Chokes GPU brute-force)
+    return argon2.low_level.hash_secret_raw(
+        secret=password.encode('utf-8'),
         salt=salt,
-        iterations=600000,
-        backend=default_backend()
+        time_cost=3,          # Number of iterations
+        memory_cost=65536,    # 64MB RAM usage per password guess!
+        parallelism=4,        # Threads
+        hash_len=32,          # 256-bit Key for AES
+        type=argon2.low_level.Type.ID
     )
-    return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
 
 def encrypt_file(raw_data, original_filename, password):
-    true_salt = os.urandom(16) 
-    q_salt = get_quantum_salt() # Runs silently now
+    true_salt = os.urandom(16)  # 16-byte KDF salt
+    nonce = os.urandom(12)      # 12-byte GCM Nonce
+    q_salt = get_quantum_salt() # Runs silently for entropy lore
+    
+    key = generate_key(password, true_salt)
+    aesgcm = AESGCM(key)
     
     payload = original_filename.encode('utf-8') + b'|||' + raw_data
-    f = Fernet(generate_key(password, true_salt))
-    ciphertext = f.encrypt(payload)
+    # Encrypts and automatically generates auth tag (No timestamp leaks!)
+    ciphertext = aesgcm.encrypt(nonce, payload, None) 
     
-    return true_salt + ciphertext
+    # Stealth Package: Salt (16) + Nonce (12) + Ciphertext
+    return true_salt + nonce + ciphertext
 
 # ====================================================
 # 3. KHTARNAAK 3D WEB UI 
@@ -265,11 +272,16 @@ def evaluate_defense(input_pass, is_web=False):
                 with open(current_target_file, "rb") as f:
                     file_data = f.read()
                 
+                # AES-GCM Payload Structure Parsing
                 extracted_salt = file_data[:16]
-                ciphertext = file_data[16:]
+                nonce = file_data[16:28]
+                ciphertext = file_data[28:]
                 
-                fernet_obj = Fernet(generate_key(input_pass, extracted_salt))
-                decrypted_payload = fernet_obj.decrypt(ciphertext)
+                key = generate_key(input_pass, extracted_salt)
+                aesgcm = AESGCM(key)
+                
+                # Decrypts and authenticates tag simultaneously
+                decrypted_payload = aesgcm.decrypt(nonce, ciphertext, None)
                 
                 filename_bytes, raw_data = decrypted_payload.split(b'|||', 1)
                 original_filename = filename_bytes.decode('utf-8')
@@ -313,7 +325,8 @@ def evaluate_defense(input_pass, is_web=False):
                         f.write(raw_data)
                     return f"[ACCESS GRANTED] Unlocked: {original_filename}\n[SUCCESS] Saved as: \033[93m{out_name}\033[0m", False
                     
-            except (InvalidToken, ValueError):
+            except (InvalidTag, argon2.exceptions.DecodingError, ValueError):
+                # Triggered if password is wrong or file is tampered
                 pass 
             except Exception as e:
                 return f"[SYSTEM ERROR] Check target integrity.", False

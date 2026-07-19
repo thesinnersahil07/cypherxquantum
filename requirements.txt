@@ -2,3 +2,4 @@ Flask
 qiskit
 qiskit-aer
 cryptography
+argon2-cffi
