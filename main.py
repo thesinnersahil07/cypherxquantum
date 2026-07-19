@@ -9,11 +9,14 @@ import json
 import urllib.request
 import atexit      
 import signal      
-import stat        # NEW: OS Privilege Override ke liye
+import stat        
 from flask import Flask, request, render_template_string, jsonify
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
 
 # ====================================================
 # 1. SYSTEM CONFIGURATION & PURE RAM STATE
@@ -27,7 +30,7 @@ troll_level = 0
 data_wiped = False
 last_attempt = time.time()
 current_target_file = None 
-is_master = False # Track karne ke liye ki yeh master hai ya client
+is_master = False 
 
 app = Flask(__name__)
 log = logging.getLogger('werkzeug')
@@ -37,13 +40,9 @@ log.setLevel(logging.ERROR)
 # 🚨 1.5 THE DEAD MAN'S SWITCH (ANTI-RAM CLEAR TRAP) 🚨
 # ====================================================
 def dead_mans_switch():
-    """Agar koi process ko kill karke RAM clear karne ki koshish kare!"""
     global current_target_file, is_master
     if is_master and current_target_file and os.path.exists(current_target_file):
-        print("\n\033[91m[🚨 DEAD MAN'S SWITCH ACTIVATED 🚨]\033[0m")
-        print("\033[91m[FATAL] Unauthorized RAM Flush Detected! Annihilating Target Vault...\033[0m")
         try:
-            # 🚨 GOD MODE: Remove Read-Only lock before wiping 🚨
             os.chmod(current_target_file, stat.S_IWRITE) 
             with open(current_target_file, "wb") as f:
                 f.write(b"0xDEADBEEF" * 100)
@@ -63,7 +62,7 @@ except Exception:
     pass
 
 # ====================================================
-# 2. CRYPTOGRAPHY ENGINE (HYBRID)
+# 2. ADVANCED HYBRID CRYPTOGRAPHY ENGINE (STEALTH)
 # ====================================================
 def get_quantum_salt():
     try:
@@ -75,19 +74,27 @@ def get_quantum_salt():
         result = job.result().get_counts()
         return list(result.keys())[0]
     except Exception:
-        return "Q-ERROR-FALLBACK-999"
+        return "Q-FALLBACK"
 
-def generate_key(password, q_salt):
-    fused_password = f"{password}_QUANTUM_{q_salt}"
-    digest = hashlib.sha256(fused_password.encode('utf-8')).digest()
-    return base64.urlsafe_b64encode(digest)
+def generate_key(password, salt):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600000,
+        backend=default_backend()
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
 
 def encrypt_file(raw_data, original_filename, password):
-    q_salt = get_quantum_salt()
+    true_salt = os.urandom(16) 
+    q_salt = get_quantum_salt() # Runs silently now
+    
     payload = original_filename.encode('utf-8') + b'|||' + raw_data
-    f = Fernet(generate_key(password, q_salt))
+    f = Fernet(generate_key(password, true_salt))
     ciphertext = f.encrypt(payload)
-    return q_salt.encode('utf-8') + b'::Q_SALT::' + ciphertext
+    
+    return true_salt + ciphertext
 
 # ====================================================
 # 3. KHTARNAAK 3D WEB UI 
@@ -122,7 +129,7 @@ HTML_TEMPLATE = """
     <div class="scene">
         <div class="card">
             <h1>⚛️ QUANTUM VAULT ⚛️</h1>
-            <p>TRUE AES-128 ENCRYPTION & PORTABILITY</p>
+            <p>SECURE TERMINAL</p>
             
             <form action="/encrypt" method="POST" enctype="multipart/form-data">
                 <input type="file" name="raw_file" required><br>
@@ -163,8 +170,8 @@ def encrypt_route():
         safe_name = original_filename.replace(' ', '_')
         out_name = f"locked_{safe_name}.bin"
         download_btn = f'<br><a href="data:application/octet-stream;base64,{b64_payload}" download="{out_name}" class="dl-btn">📥 DOWNLOAD ENCRYPTED VAULT</a>'
-        return render_template_string(HTML_TEMPLATE, msg=f"[STATUS] '{original_filename}' SECURELY ENCRYPTED 😎<br>{download_btn}")
-    return render_template_string(HTML_TEMPLATE, msg="[ERROR] ENCRYPTION FAILED.")
+        return render_template_string(HTML_TEMPLATE, msg=f"[STATUS] Vault Locked.<br>{download_btn}")
+    return render_template_string(HTML_TEMPLATE, msg="[ERROR] Operation Failed.")
 
 @app.route('/decrypt', methods=['POST'])
 def decrypt_route():
@@ -199,11 +206,11 @@ def handle_cli_command(user_input):
 
     if user_input.lower() == "/help":
         return ("\033[93m=== SYSTEM COMMANDS ===\n"
-                "  /encrypt <path> <pass> : Encrypt a file locally\n"
-                "  /decrypt <path>        : Set active target for Decryption\n"
+                "  /encrypt <path> <pass> : Encrypt a file\n"
+                "  /decrypt <path>        : Set active target\n"
                 "  /help                  : Show this menu\n"
-                "  /exit                  : Terminate terminal\n"
-                "  <any other text>       : Try to unlock the Active Target\n\033[0m")
+                "  /exit                  : Terminate\n"
+                "  <any other text>       : Input key for target\n\033[0m")
 
     if user_input.lower().startswith("/encrypt "):
         try:
@@ -218,9 +225,9 @@ def handle_cli_command(user_input):
                 out_name = f"locked_{original_filename}.bin"
                 with open(out_name, "wb") as f:
                     f.write(encrypted_payload)
-                return f"\033[92m[SUCCESS] File encrypted and saved locally as '{out_name}' 😎\033[0m"
+                return f"\033[92m[SUCCESS] Vault sealed: '{out_name}'\033[0m"
             else:
-                return "\033[91m[ERROR] File not found!\033[0m"
+                return "\033[91m[ERROR] File not found.\033[0m"
         except Exception:
             return "\033[91m[ERROR] Syntax: /encrypt <filepath> <password>\033[0m"
 
@@ -234,9 +241,9 @@ def handle_cli_command(user_input):
                     troll_level = 0
                     data_wiped = False
                     last_attempt = time.time()
-            return f"\033[93m[STATUS] Target Locked onto '{filepath}'. Entering Access Key stream...\033[0m"
+            return f"\033[93m[OK] Target selected. Awaiting input.\033[0m"
         else:
-            return "\033[91m[ERROR] File not found!\033[0m"
+            return "\033[91m[ERROR] File not found.\033[0m"
 
     response, is_wiped = evaluate_defense(user_input, is_web=False)
     if "GRANTED" in response: return f"\033[96m{response}\033[0m"
@@ -258,10 +265,10 @@ def evaluate_defense(input_pass, is_web=False):
                 with open(current_target_file, "rb") as f:
                     file_data = f.read()
                 
-                salt_bytes, ciphertext = file_data.split(b'::Q_SALT::', 1)
-                q_salt = salt_bytes.decode('utf-8')
+                extracted_salt = file_data[:16]
+                ciphertext = file_data[16:]
                 
-                fernet_obj = Fernet(generate_key(input_pass, q_salt))
+                fernet_obj = Fernet(generate_key(input_pass, extracted_salt))
                 decrypted_payload = fernet_obj.decrypt(ciphertext)
                 
                 filename_bytes, raw_data = decrypted_payload.split(b'|||', 1)
@@ -298,7 +305,7 @@ def evaluate_defense(input_pass, is_web=False):
                             
                     out_name = f"decrypted_{original_filename}"
                     dl_button = f'<br><br><a href="data:{mime};base64,{b64_raw}" download="{out_name}" class="dl-btn">📥 DOWNLOAD DECRYPTED FILE</a>'
-                    return f"[ACCESS GRANTED] Unlocked: {original_filename}<br>Quantum Salt Used: {q_salt}<br>{content_html}{dl_button}", False
+                    return f"[ACCESS GRANTED] Unlocked: {original_filename}<br>{content_html}{dl_button}", False
 
                 else:
                     out_name = f"decrypted_{original_filename}"
@@ -309,16 +316,16 @@ def evaluate_defense(input_pass, is_web=False):
             except (InvalidToken, ValueError):
                 pass 
             except Exception as e:
-                return f"[SYSTEM ERROR] {str(e)}", False
+                return f"[SYSTEM ERROR] Check target integrity.", False
         else:
-            return "[WARNING] No active file target detected. Use /decrypt <path> first.", False
+            return "[WARNING] No active file target detected.", False
 
-        # === 🚨 PERMANENT WIPE (GOD MODE OVERRIDE) 🚨 ===
+        # === 🚨 PERMANENT WIPE 🚨 ===
         if troll_level == 2:
             data_wiped = True
             if current_target_file and os.path.exists(current_target_file):
                 try:
-                    os.chmod(current_target_file, stat.S_IWRITE) # God Mode bypass Read-Only
+                    os.chmod(current_target_file, stat.S_IWRITE) 
                     with open(current_target_file, "wb") as f:
                         f.write(b"0xDEADBEEF" * 100) 
                     os.remove(current_target_file)
@@ -344,7 +351,7 @@ def evaluate_defense(input_pass, is_web=False):
             troll_level = 1
             return "LEVEL SABKY NIKLYGY! Lekin is file ka nahi niklega.", False
 
-        return "[ACCESS DENIED] Wrong Password.", False
+        return "[ACCESS DENIED] Invalid Key.", False
 
 def run_web_server():
     app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
@@ -368,21 +375,18 @@ def send_to_master(cmd):
         result = json.loads(resp.read())
         print(result['response'] + "\n")
     except Exception as e:
-        print(f"\033[91m[API ERROR] Master link broken. {e}\033[0m\n")
+        print(f"\033[91m[API ERROR] Link broken.\033[0m\n")
 
 if __name__ == "__main__":
     if is_master_running():
-        # CLIENT MODE
         if not sys.stdin.isatty():
             for line in sys.stdin:
                 cmd = line.strip()
                 if cmd: send_to_master(cmd)
         else:
-            print("\033[93m[SYSTEM] Vault Daemon is active in another terminal.\033[0m")
-            print("\033[93mExecute Payload via Pipeline e.g.: type wordlist.txt | python main.py\033[0m\n")
+            print("\033[93m[SYSTEM] Daemon active in another terminal.\033[0m")
         sys.exit(0)
 
-    # MASTER DAEMON MODE
     is_master = True 
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
@@ -391,9 +395,9 @@ if __name__ == "__main__":
     os.system('cls' if os.name == 'nt' else 'clear')
     print("\033[92m")
     print("="*60)
-    print(" ⚛️  CIPHER X QUANTUM - ADVANCED DEFENSE TERMINAL  ⚛️")
-    print(" 🌐 3D Web UI Live at: http://127.0.0.1:5000")
-    print(" 💡 Type \033[93m/help\033[92m to see available CLI commands.")
+    print(" ⚛️  QUANTUM VAULT - SECURE TERMINAL  ⚛️")
+    print(" 🌐 Web UI: http://127.0.0.1:5000")
+    print(" 💡 Type \033[93m/help\033[92m for commands.")
     print("="*60 + "\033[0m\n")
 
     while True:
@@ -407,6 +411,6 @@ if __name__ == "__main__":
         except EOFError:
             break
         except KeyboardInterrupt:
-            is_master = False # Disable switch for safe exit
-            print("\n[SYSTEM] Terminating Securely...")
+            is_master = False 
+            print("\n[SYSTEM] Terminating...")
             break
