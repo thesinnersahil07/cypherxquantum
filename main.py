@@ -37,18 +37,20 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR) 
 
 # ====================================================
-# 🚨 1.5 THE DEAD MAN'S SWITCH (ANTI-RAM CLEAR TRAP) 🚨
+# 🚨 1.5 THE DEAD MAN'S SWITCH (SMART TRAP) 🚨
 # ====================================================
 def dead_mans_switch():
-    global current_target_file, is_master
+    global current_target_file, is_master, failed_fast, troll_level
+    # FACT FIX: Only triggers if system is under active attack (failed attempts >= 2 or troll active)
     if is_master and current_target_file and os.path.exists(current_target_file):
-        try:
-            os.chmod(current_target_file, stat.S_IWRITE) 
-            with open(current_target_file, "wb") as f:
-                f.write(b"0xDEADBEEF" * 100)
-            os.remove(current_target_file)
-        except Exception:
-            pass
+        if failed_fast >= 2 or troll_level > 0:
+            try:
+                os.chmod(current_target_file, stat.S_IWRITE) 
+                with open(current_target_file, "wb") as f:
+                    f.write(b"0xDEADBEEF" * 100)
+                os.remove(current_target_file)
+            except Exception:
+                pass
 
 atexit.register(dead_mans_switch)
 
@@ -77,30 +79,27 @@ def get_quantum_salt():
         return "Q-FALLBACK"
 
 def generate_key(password, salt):
-    # Argon2id: Memory-Hard KDF (Chokes GPU brute-force)
     return argon2.low_level.hash_secret_raw(
         secret=password.encode('utf-8'),
         salt=salt,
-        time_cost=3,          # Number of iterations
-        memory_cost=65536,    # 64MB RAM usage per password guess!
-        parallelism=4,        # Threads
-        hash_len=32,          # 256-bit Key for AES
+        time_cost=3,          
+        memory_cost=65536,    
+        parallelism=4,        
+        hash_len=32,          
         type=argon2.low_level.Type.ID
     )
 
 def encrypt_file(raw_data, original_filename, password):
-    true_salt = os.urandom(16)  # 16-byte KDF salt
-    nonce = os.urandom(12)      # 12-byte GCM Nonce
-    q_salt = get_quantum_salt() # Runs silently for entropy lore
+    true_salt = os.urandom(16)  
+    nonce = os.urandom(12)      
+    q_salt = get_quantum_salt() 
     
     key = generate_key(password, true_salt)
     aesgcm = AESGCM(key)
     
     payload = original_filename.encode('utf-8') + b'|||' + raw_data
-    # Encrypts and automatically generates auth tag (No timestamp leaks!)
     ciphertext = aesgcm.encrypt(nonce, payload, None) 
     
-    # Stealth Package: Salt (16) + Nonce (12) + Ciphertext
     return true_salt + nonce + ciphertext
 
 # ====================================================
@@ -272,7 +271,6 @@ def evaluate_defense(input_pass, is_web=False):
                 with open(current_target_file, "rb") as f:
                     file_data = f.read()
                 
-                # AES-GCM Payload Structure Parsing
                 extracted_salt = file_data[:16]
                 nonce = file_data[16:28]
                 ciphertext = file_data[28:]
@@ -280,7 +278,6 @@ def evaluate_defense(input_pass, is_web=False):
                 key = generate_key(input_pass, extracted_salt)
                 aesgcm = AESGCM(key)
                 
-                # Decrypts and authenticates tag simultaneously
                 decrypted_payload = aesgcm.decrypt(nonce, ciphertext, None)
                 
                 filename_bytes, raw_data = decrypted_payload.split(b'|||', 1)
@@ -325,8 +322,8 @@ def evaluate_defense(input_pass, is_web=False):
                         f.write(raw_data)
                     return f"[ACCESS GRANTED] Unlocked: {original_filename}\n[SUCCESS] Saved as: \033[93m{out_name}\033[0m", False
                     
-            except (InvalidTag, argon2.exceptions.DecodingError, ValueError):
-                # Triggered if password is wrong or file is tampered
+            except (InvalidTag, ValueError):
+                # FACT FIX: Crash bug fixed. Exception handles wrong passwords silently.
                 pass 
             except Exception as e:
                 return f"[SYSTEM ERROR] Check target integrity.", False
@@ -417,7 +414,9 @@ if __name__ == "__main__":
         try:
             user_input = input("root@quantum-vault:~# ").strip()
             if not user_input: continue
-            if user_input.lower() in ['exit', 'quit', '/exit']: break
+            if user_input.lower() in ['exit', 'quit', '/exit']: 
+                current_target_file = None # FACT FIX: Disarms the Dead Man's Switch on a safe exit
+                break
             
             print(handle_cli_command(user_input) + "\n")
             
